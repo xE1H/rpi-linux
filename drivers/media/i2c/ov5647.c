@@ -126,7 +126,7 @@ struct ov5647 {
 	struct mutex			lock;
 	struct clk			*xclk;
 	struct gpio_desc		*pwdn;
-	struct regulator_bulk_data supplies[OV5647_NUM_SUPPLIES];
+        struct regulator_bulk_data supplies[OV5647_NUM_SUPPLIES];
 	bool				clock_ncont;
 	struct v4l2_ctrl_handler	ctrls;
 	const struct ov5647_mode	*mode;
@@ -1379,100 +1379,160 @@ out:
 
 static int ov5647_probe(struct i2c_client *client)
 {
-	struct device_node *np = client->dev.of_node;
-	struct device *dev = &client->dev;
-	struct ov5647 *sensor;
-	struct v4l2_subdev *sd;
-	u32 xclk_freq;
-	int ret;
+    struct device_node *np = client->dev.of_node;
+    struct device *dev = &client->dev;
+    struct ov5647 *sensor;
+    struct v4l2_subdev *sd;
+    u32 xclk_freq;
+    int ret;
 
-	sensor = devm_kzalloc(dev, sizeof(*sensor), GFP_KERNEL);
-	if (!sensor)
-		return -ENOMEM;
+    sensor = devm_kzalloc(dev, sizeof(*sensor), GFP_KERNEL);
+    if (!sensor)
+        return -ENOMEM;
 
-	if (IS_ENABLED(CONFIG_OF) && np) {
-		ret = ov5647_parse_dt(sensor, np);
-		if (ret) {
-			dev_err(dev, "DT parsing error: %d\n", ret);
-			return ret;
-		}
-	}
+    if (IS_ENABLED(CONFIG_OF) && np) {
+        ret = ov5647_parse_dt(sensor, np);
+        if (ret) {
+            dev_err(dev, "DT parsing error: %d\n", ret);
+            return ret;
+        }
+    }
 
-	sensor->xclk = devm_clk_get(dev, NULL);
-	if (IS_ERR(sensor->xclk)) {
-		dev_err(dev, "could not get xclk");
-		return PTR_ERR(sensor->xclk);
-	}
+    /* Initialize power supplies */
+    sensor->supplies[0].supply = "avdd";
+    sensor->supplies[1].supply = "dovdd";
+    sensor->supplies[2].supply = "dvdd";
+    ret = devm_regulator_bulk_get(dev, 3, sensor->supplies);
+    if (ret < 0) {
+        dev_err(dev, "Failed to get power regulators: %d\n", ret);
+        return ret;
+    }
 
-	xclk_freq = clk_get_rate(sensor->xclk);
-	if (xclk_freq != 25000000) {
-		dev_err(dev, "Unsupported clock frequency: %u\n", xclk_freq);
-		return -EINVAL;
-	}
+    sensor->xclk = devm_clk_get(dev, NULL);
+    if (IS_ERR(sensor->xclk)) {
+        dev_err(dev, "could not get xclk");
+        return PTR_ERR(sensor->xclk);
+    }
 
-	/* Request the power down GPIO asserted. */
-	sensor->pwdn = devm_gpiod_get_optional(dev, "pwdn", GPIOD_OUT_HIGH);
-	if (IS_ERR(sensor->pwdn)) {
-		dev_err(dev, "Failed to get 'pwdn' gpio\n");
-		return -EINVAL;
-	}
+    xclk_freq = clk_get_rate(sensor->xclk);
+    if (xclk_freq != 25000000) {
+        dev_err(dev, "Unsupported clock frequency: %u\n", xclk_freq);
+        return -EINVAL;
+    }
 
-	ret = ov5647_configure_regulators(dev, sensor);
-	if (ret) {
-		dev_err(dev, "Failed to get power regulators\n");
-		return ret;
-	}
+    /* Request the power down GPIO asserted. */
+    sensor->pwdn = devm_gpiod_get_optional(dev, "pwdn", GPIOD_OUT_HIGH);
+    if (IS_ERR(sensor->pwdn)) {
+        dev_err(dev, "Failed to get 'pwdn' gpio\n");
+        return -EINVAL;
+    }
 
-	mutex_init(&sensor->lock);
+    mutex_init(&sensor->lock);
 
-	sensor->mode = OV5647_DEFAULT_MODE;
+    sensor->mode = OV5647_DEFAULT_MODE;
 
-	ret = ov5647_init_controls(sensor, dev);
-	if (ret)
-		goto mutex_destroy;
+    ret = ov5647_init_controls(sensor);
+    if (ret)
+        goto mutex_destroy;
 
-	sd = &sensor->sd;
-	v4l2_i2c_subdev_init(sd, client, &ov5647_subdev_ops);
-	sd->internal_ops = &ov5647_subdev_internal_ops;
-	sd->flags |= V4L2_SUBDEV_FL_HAS_DEVNODE | V4L2_SUBDEV_FL_HAS_EVENTS;
+    sd = &sensor->sd;
+    v4l2_i2c_subdev_init(sd, client, &ov5647_subdev_ops);
+    sd->internal_ops = &ov5647_subdev_internal_ops;
+    sd->flags |= V4L2_SUBDEV_FL_HAS_DEVNODE | V4L2_SUBDEV_FL_HAS_EVENTS;
 
-	sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
-	sd->entity.function = MEDIA_ENT_F_CAM_SENSOR;
-	ret = media_entity_pads_init(&sd->entity, 1, &sensor->pad);
-	if (ret < 0)
-		goto ctrl_handler_free;
+    sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
+    sd->entity.function = MEDIA_ENT_F_CAM_SENSOR;
+    ret = media_entity_pads_init(&sd->entity, 1, &sensor->pad);
+    if (ret < 0)
+        goto ctrl_handler_free;
 
-	ret = ov5647_power_on(dev);
-	if (ret)
-		goto entity_cleanup;
+    /* Enable regulators before power on */
+    ret = regulator_bulk_enable(3, sensor->supplies);
+    if (ret < 0) {
+        dev_err(dev, "Failed to enable regulators: %d\n", ret);
+        goto entity_cleanup;
+    }
+    
+    /* Important delay after enabling regulators */
+    msleep(20);
 
-	ret = ov5647_detect(sd);
-	if (ret < 0)
-		goto power_off;
+    ret = ov5647_power_on(dev);
+    if (ret)
+        goto power_reg_off;
 
-	ret = v4l2_async_register_subdev_sensor(sd);
-	if (ret < 0)
-		goto power_off;
+    /* Check camera chip identity */
+    ret = ov5647_detect(sd);
+    if (ret < 0)
+        goto power_off;
 
-	/* Enable runtime PM and turn off the device */
-	pm_runtime_set_active(dev);
-	pm_runtime_enable(dev);
-	pm_runtime_idle(dev);
+    ret = v4l2_async_register_subdev(sd);
+    if (ret < 0)
+        goto power_off;
 
-	dev_dbg(dev, "OmniVision OV5647 camera driver probed\n");
+    /* Enable runtime PM and turn off the device */
+    pm_runtime_set_active(dev);
+    pm_runtime_enable(dev);
+    pm_runtime_idle(dev);
 
-	return 0;
+    dev_info(dev, "OmniVision OV5647 camera driver probed\n");
+
+    return 0;
 
 power_off:
-	ov5647_power_off(dev);
+    ov5647_power_off(dev);
+power_reg_off:
+    regulator_bulk_disable(3, sensor->supplies);
 entity_cleanup:
-	media_entity_cleanup(&sd->entity);
+    media_entity_cleanup(&sd->entity);
 ctrl_handler_free:
-	v4l2_ctrl_handler_free(&sensor->ctrls);
+    v4l2_ctrl_handler_free(&sensor->ctrls);
 mutex_destroy:
-	mutex_destroy(&sensor->lock);
+    mutex_destroy(&sensor->lock);
 
-	return ret;
+    return ret;
+}
+
+static int ov5647_detect(struct v4l2_subdev *sd)
+{
+    struct i2c_client *client = v4l2_get_subdevdata(sd);
+    struct ov5647 *sensor = to_ov5647(sd);
+    struct device *dev = &client->dev;
+    u8 id_high, id_low;
+    int ret;
+    u16 reg;
+    
+    /* Prepare I2C bus before reading */
+    reg = 0x301;
+    ret = i2c_master_send(client, (char *)&reg, 2);
+    if (ret < 0)
+        return ret;
+        
+    /* Read ID High (0x300A) - Should be 'V' (0x56) */
+    ret = ov5647_read(client, 0x300a, &id_high);
+    if (ret < 0)
+        return ret;
+        
+    if (id_high != 0x56) {
+        dev_err(dev, "ID High expected 0x56, got 0x%x\n", id_high);
+        return -ENODEV;
+    }
+    
+    /* Read ID Low (0x300B) - Should be 'G' (0x47) */
+    ret = ov5647_read(client, 0x300b, &id_low);
+    if (ret < 0)
+        return ret;
+        
+    if (id_low != 0x47) {
+        dev_err(dev, "ID Low expected 0x47, got 0x%x\n", id_low);
+        return -ENODEV;
+    }
+    
+    /* Reset the I2C interface */
+    reg = 0x0;
+    ret = i2c_master_send(client, (char *)&reg, 2);
+    
+    dev_info(dev, "OV5647 camera sensor detected (ID: %c%c)\n", id_high, id_low);
+    return 0;
 }
 
 static void ov5647_remove(struct i2c_client *client)
